@@ -16,3 +16,19 @@
 
 ## Технологический стек
 Python · FastAPI · Oylan API
+## Архитектура проекта
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Client as Клиент (Frontend / Postman)
+    participant Backend as Ваш Бэкенд (FastAPI)
+    participant AI as Модель ИИ (Oylan API)
+
+    Client->>Backend: POST /chat (Координаты + тип объекта)
+    Note over Backend: Валидация координат,<br/>сборка системного промпта,<br/>подстановка API-ключа
+    Backend->>AI: Передача промпта и данных (HTTPS)
+    Note over AI: Анализ PM2.5 и грунта,<br/>генерация рекомендаций
+    AI-->>Backend: Текстовый ответ модели
+    Note over Backend: Формирование финального JSON-пакета
+    Backend-->>Client: Ответ: 200 OK (JSON с отчетом)
