@@ -1,27 +1,41 @@
-from fastapi import FastAPI
+import os
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from typing import List
+from typing import List, Optional
+from dotenv import load_dotenv
 
-app = FastAPI(title="SentrySite AI - Verified Edition")
+# Импортируем все функции интеграции с Oylan API
+from services.oylan import (
+    send_message, 
+    fetch_assistants, 
+    create_new_assistant, 
+    clear_assistant_context
+)
+
+load_dotenv()
+
+app = FastAPI(title="SentrySite AI - Oylan Comprehensive Edition")
 
 # --- МОДЕЛИ ДАННЫХ (Pydantic Models) ---
 
-# 1. Твоя оригинальная модель для чата (ОСТАЕТСЯ КАК БЫЛО)
 class SiteRequest(BaseModel):
     lat: float
     lon: float
     object_type: str
 
-# 2. НОВАЯ модель для второго эндпоинта (только координаты)
 class CoordinatesRequest(BaseModel):
     lat: float
     lon: float
 
-# 3. Модель для сравнения двух строительных площадок
 class CompareRequest(BaseModel):
     object_type: str
-    location_A: List[float]
-    location_B: List[float]
+    location_A: CoordinatesRequest
+    location_B: CoordinatesRequest
+
+# Модель для создания нового ассистента через API
+class AssistantCreateRequest(BaseModel):
+    name: str
+    model: Optional[str] = "Oylan"
 
 
 # --- ИМИТАЦИЯ БАЗЫ ДАННЫХ ---
@@ -42,36 +56,79 @@ def get_pm25(lat: float, lon: float):
 # --- СИСТЕМНЫЕ ЭНДПОИНТЫ ---
 @app.get("/")
 def root():
-    return {"message": "SentrySite AI Backend is running!"}
+    return {"message": "SentrySite AI Backend with full Oylan lifecycle is running!"}
 
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
 
-# --- ИНЖЕНЕРНЫЕ ЭНДПОИНТЫ ---
+# --- ЭНДПОИНТЫ ИЗ СКРИНШОТА СИСТЕМЫ OYLAN ---
 
-# 1. ТВОЙ СТАРЫЙ ЧАТ (Остался точно таким же, как и был)
-@app.post("/chat", summary="Экспресс-анализ по объекту и координатам")
-def old_chat(request: SiteRequest):
+# 1. GET /assistant/ — Список ассистентов
+@app.get("/assistant", summary="Список ассистентов -> берем id")
+async def get_assistants():
+    try:
+        data = await fetch_assistants()
+        return data
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Не удалось получить список: {str(e)}")
+
+# 2. POST /assistant/ — Создать нового ассистента
+@app.post("/assistant", summary="Создать нового ассистента (model: 'Oylan')")
+async def add_assistant(req: AssistantCreateRequest):
+    try:
+        data = await create_new_assistant(name=req.name, model=req.model)
+        return data
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Ошибка создания ассистента: {str(e)}")
+
+# 3. POST /assistant/{id}/interactions/ — Отправить сообщение -> получить ответ
+# Привязан к нашей логике SiteRequest для бесшовного анализа координат!
+@app.post("/chat", summary="Отправить сообщение ассистенту (Экспресс-анализ)")
+async def chat_with_oylan(request: SiteRequest):
     pm25, city = get_pm25(request.lat, request.lon)
     safe = pm25 <= 5
+    
+    prompt = (
+        f"Проанализируй экологическую обстановку для строительного объекта '{request.object_type}'. "
+        f"Локация: {city} (координаты: {request.lat}, {request.lon}). "
+        f"Текущий зафиксированный уровень мелкодисперсных частиц PM2.5 составляет {pm25} мкг/м³. "
+        f"Это {'соответствует' if safe else 'ПРЕВЫШАЕТ'} норму ВОЗ. "
+        f"Дай краткую, но профессиональную строительно-экологическую рекомендацию."
+    )
+    
+    try:
+        oylan_reply = await send_message(prompt)
+    except Exception as e:
+        print(f"Ошибка вызова Oylan API: {e}")
+        oylan_reply = f"Интеграция временно недоступна. Техническая сводка: PM2.5 = {pm25} мкг/м³ в городе {city}."
+
     return {
         "status": "ok",
         "city": city,
         "pm25": pm25,
         "safe": safe,
-        "reply": "Безопасно ✅" if safe else f"Опасно! PM2.5 = {pm25} мкг/м³ — выше нормы ВОЗ в {round(pm25/5, 1)}x ❌",
-        "object_type": request.object_type  # Возвращаем тип объекта назад
+        "object_type": request.object_type,
+        "reply": oylan_reply
     }
 
-# 2. НОВЫЙ ЭНДПОИНТ (Принимает ТОЛЬКО координаты и дает чистую рекомендацию)
+# 4. DELETE /assistant/{id}/contexts/ — Очистить контекст файла/истории
+@app.delete("/assistant/{assistant_id}/contexts", summary="Очистить контекст и историю чата ассистента")
+async def clear_context(assistant_id: str):
+    try:
+        result = await clear_assistant_context(assistant_id)
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Ошибка очистки контекста: {str(e)}")
+
+
+# --- ОСТАЛЬНЫЕ ИНЖЕНЕРНЫЕ ЭНДПОИНТЫ ---
+
 @app.post("/analyze", summary="Получить рекомендацию только по координатам")
 def analyze_by_coordinates(request: CoordinatesRequest):
-    """Принимает исключительно широту и долготу, возвращает эко-заключение"""
     pm25, city = get_pm25(request.lat, request.lon)
     
-    # Формируем логику рекомендаций
     if pm25 <= 12.0:
         recommendation = "Зона полностью безопасна. Дополнительная фильтрация не требуется."
     else:
@@ -84,7 +141,6 @@ def analyze_by_coordinates(request: CoordinatesRequest):
         "recommendation": recommendation
     }
 
-# 3. СПИСОК ГОРОДОВ
 @app.get("/cities", summary="Список поддерживаемых городов")
 def get_supported_cities():
     return {
@@ -92,11 +148,10 @@ def get_supported_cities():
         "supported_cities": CITY_DATA
     }
 
-# 4. СРАВНЕНИЕ ДВУХ СТРОИТЕЛЬНЫХ ПЛОЩАДОК
 @app.post("/compare", summary="Сравнение двух строительных площадок")
 def compare_sites(req: CompareRequest):
-    pm25_A, city_A = get_pm25(req.location_A[0], req.location_A[1])
-    pm25_B, city_B = get_pm25(req.location_B[0], req.location_B[1])
+    pm25_A, city_A = get_pm25(req.location_A.lat, req.location_A.lon)
+    pm25_B, city_B = get_pm25(req.location_B.lat, req.location_B.lon)
     
     if pm25_A < pm25_B:
         winner = "Location A"
@@ -121,3 +176,7 @@ def compare_sites(req: CompareRequest):
             "location_B": {"city": city_B, "pm25": pm25_B}
         }
     }
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="127.0.0.1", port=8000)
