@@ -2,6 +2,7 @@ import os
 from typing import List, Optional
 from fastapi import FastAPI, HTTPException, Depends
 from fastapi.responses import PlainTextResponse
+from fastapi.middleware.cors import CORSMiddleware  # Урок 6: Импортируем CORS
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import text
@@ -21,6 +22,18 @@ from services.oylan import (
 )
 
 app = FastAPI(title="SentrySite AI - Oylan Comprehensive Enterprise Edition")
+
+# --- Урок 6: Настройка CORS для интеграции с React-фронтендом ---
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:5173",  # Локальный адрес разработки React (Vite)
+        "http://localhost:3000",  # Альтернативный порт
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],  # Разрешаем все методы (GET, POST, OPTIONS, DELETE и др.)
+    allow_headers=["*"],  # Разрешаем любые заголовки
+)
 
 
 # Безопасная инициализация изолированной схемы и таблицы при старте приложения
@@ -165,6 +178,7 @@ async def chat_with_oylan(request: SiteRequest, db: AsyncSession = Depends(get_d
         print(f"Ошибка вызова Oylan API или БД: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+    # 4. Сохраняем в локальное хранилище отчетов
     report_id = str(len(REPORTS_STORAGE) + 1)
     REPORTS_STORAGE[report_id] = {
         "city": city,
@@ -173,6 +187,7 @@ async def chat_with_oylan(request: SiteRequest, db: AsyncSession = Depends(get_d
         "reply": oylan_reply
     }
 
+    # 5. Возвращаем JSON-ответ (совместимый с Chat.jsx)
     return {
         "report_id": report_id,
         "status": "ok",
@@ -181,9 +196,9 @@ async def chat_with_oylan(request: SiteRequest, db: AsyncSession = Depends(get_d
         "safe": safe,
         "object_type": request.object_type,
         "reply": oylan_reply,
+        "response": oylan_reply,  # Фикс: дублируем для фронтенда, если он ищет data.response
         "session_id": request.session_id
     }
-
 
 # --- ЭНДПОИНТ ДЛЯ ПРОСМОТРА ИСТОРИИ ИЗ ПОСТГРЕСА ---
 
