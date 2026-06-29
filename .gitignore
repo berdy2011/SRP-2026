@@ -1,4 +1,8 @@
-venv/
 .env
+.env.local
+jolfix-frontend/.env
+jolfix-frontend/.env.local
+venv/
+node_modules/
 __pycache__/
 *.pyc

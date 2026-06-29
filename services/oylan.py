@@ -1,5 +1,6 @@
 import os
 import httpx
+import asyncio
 from google import genai
 from google.genai import types
 from typing import List, Dict, Optional
@@ -14,6 +15,7 @@ BASE_URL = os.getenv('OYLAN_BASE_URL')
 
 HEADERS = {
     'Authorization': f'Api-Key {API_KEY}',
+    'Content-Type': 'application/json',
     'accept': 'application/json'
 }
 
@@ -25,93 +27,91 @@ if not client_ai:
     print("⚠️ Внимание: GEMINI_API_KEY не найден в файле .env")
 
 
-def generate_local_response(user_msg: str, history: Optional[List[Dict[str, str]]] = None) -> str:
-    """Генерирует ответ с помощью нового SDK google-genai с жестким вырезанием застрявших тем"""
+async def generate_local_response(user_msg: str, history: Optional[List[Dict[str, str]]] = None) -> str:
+    """Асинхронно генерирует чистый ответ без эффекта 'снежного кома' и повторений из истории"""
     if not client_ai:
-        return (
-            "🤖 [SentrySite AI — Автономный режим]: Реальный ИИ не подключен. "
-            "Пожалуйста, добавьте GEMINI_API_KEY в ваш файл .env!"
-        )
+        return "[SentrySite AI]: Автономный режим. Добавьте GEMINI_API_KEY в .env"
     
     config = types.GenerateContentConfig(
         system_instruction=(
-            "Ты — Oylan AI Assistant, интеллектуальный модуль для системы экологического мониторинга SentrySite AI. "
-            "Твой создатель и разработчик — Бердыхан. Ты всегда знаешь, что общаешься именно с ним. "
-            "СТРОГОЕ ПРАВИЛО: Отвечай только на то, о чем тебя спросили в текущем сообщении пользователя. "
-            "Если пользователь шутит, просит анекдот, здоровается или общается на отвлеченные темы — "
-            "отвечай легко, коротко и с юмором. Запрещено самостоятельно упоминать жилые комплексы, "
-            "показатели PM2.5, вентиляцию и фильтры HEPA, если пользователь сам прямо не задал технический вопрос про экологию."
+            "Ты — Oylan AI Assistant, модуль экологического мониторинга SentrySite AI. "
+            "Твой создатель — Бердыхан. Ты всегда общаешься напрямую с ним. "
+            "ЖЕСТКОЕ ПРАВИЛО: Отвечай только на текущий вопрос пользователя. "
+            "Если тебя спрашивают про время суток, анекдоты, приветствия или вежливость — "
+            "отвечай живо, емко и человечно. Тебе КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО добавлять абзацы "
+            "про вентиляцию, многоступенчатую фильтрацию, ЖК и строительные рекомендации, "
+            "если тебя об этом не спросили прямо в последней реплике."
         ),
-        temperature=0.3
+        temperature=0.2
     )
 
     contents = []
+    # Проверяем, носит ли текущий запрос технический характер
+    is_technical_query = any(word in user_msg.lower() for word in ["датчик", "вентиляц", "фильтр", "pm2.5", "инфильтрац"])
     
-    # Список слов-маркеров, которые заставляют модель зацикливаться
-    bug_markers = ["жилого комплекса", "жилом комплексе", "hepa", "вентиляции", "pm2.5", "23.5"]
-    
-    # 1. Защита: Очищаем текущее сообщение пользователя, если в него пролез старый контекст при склейке
-    cleaned_user_msg = user_msg
-    for marker in bug_markers:
-        if marker in cleaned_user_msg.lower() and not any(eco_word in cleaned_user_msg.lower() for eco_word in ["датчик", "качество воздуха", "мониторинг"]):
-            # Если пользователь спросил анекдот или "как дела", но там висит хвост про вентиляцию — отрезаем этот хвост
-            lines = cleaned_user_msg.split('\n')
-            if lines:
-                cleaned_user_msg = lines[-1] if "User:" in lines[-1] else lines[0]
-                cleaned_user_msg = cleaned_user_msg.replace("User:", "").strip()
-
-    # 2. Защита: Проверяем историю. Если там сидит зацикливание — полностью её игнорируем
-    history_is_bugged = False
     if history:
         for msg in history:
-            content_str = msg.get('content', '').lower()
-            if any(marker in content_str for marker in bug_markers):
-                history_is_bugged = True
-                break
+            role = msg.get('role', 'user')
+            content_text = msg.get('content', '')
+            
+            if role == 'assistant' or role == 'model':
+                # 1. Защита от строительных шаблонов: убираем старый бред, если текущий вопрос — просто болтовня
+                if not is_technical_query and any(bad in content_text.lower() for bad in ["вентиляц", "объект", "комплекс", "рекомендац"]):
+                    continue
+                
+                # 2. Защита от эффекта 'попугая': срезаем старые приветствия и шутки из памяти модели,
+                # чтобы она не дублировала их бесконечно в новых ответах
+                if not is_technical_query:
+                    content_text = content_text.replace("Привет, Бердыхан!", "").replace("На связи.", "").strip()
+                    if any(joke_word in content_text for joke_word in ["Хэллоуин", "OCT 31", "Рождество", "шутка:"]):
+                        continue
+            
+            if not content_text.strip():
+                continue
 
-    if history and not history_is_bugged:
-        for msg in history:
-            role = "user" if msg['role'] == 'user' else "model"
+            genai_role = "user" if role == 'user' else "model"
             contents.append(
                 types.Content(
-                    role=role,
-                    parts=[types.Part.from_text(text=msg['content'])]
+                    role=genai_role,
+                    parts=[types.Part.from_text(text=content_text)]
                 )
             )
-    
-    # Добавляем очищенное сообщение пользователя
+            
+    # Добавляем актуальный очищенный запрос пользователя
     contents.append(
-        types.Content(role="user", parts=[types.Part.from_text(text=cleaned_user_msg)])
+        types.Content(role="user", parts=[types.Part.from_text(text=user_msg)])
     )
 
-    models_to_try = ['gemini-2.5-flash', 'gemini-1.5-flash', 'gemini-1.5-flash-8b']
+    # Приоритетный список современных моделей для Google GenAI SDK v1
+    models_to_try = ['gemini-2.5-flash', 'gemini-1.5-flash']
 
     for model_name in models_to_try:
         try:
-            response = client_ai.models.generate_content(
-                model=model_name,
-                contents=contents,
-                config=config,
+            # Выполняем блокирующий сетевой вызов SDK в пул-потоков, освобождая Event Loop
+            loop = asyncio.get_event_loop()
+            response = await loop.run_in_executor(
+                None, 
+                lambda: client_ai.models.generate_content(
+                    model=model_name,
+                    contents=contents,
+                    config=config,
+                )
             )
             if response.text:
                 return response.text
         except Exception as e:
-            print(f"⚠️ Модель {model_name} недоступна ({e}). Пробую следующую...")
+            print(f"⚠️ Модель {model_name} недоступна ({e}). Пробую альтернативу...")
             continue
 
-    return (
-        "🤖 [SentrySite AI]: Все ИИ-модели Google сейчас испытывают высокую нагрузку (ошибка 503).\n"
-        "Пожалуйста, подожди пару секунд и отправь сообщение заново!"
-    )
+    return "🤖 [SentrySite AI]: Резервные серверы временно перегружены. Попробуйте еще раз."
 
 
 # --- БЛОК СЕТЕВЫХ ЗАПРОСОВ К ОСНОВНОМУ СЕРВЕРУ ---
 
 async def send_message(content: str, history: Optional[List[Dict[str, str]]] = None) -> str:
-    """Отправляет запрос на внешний сервер Oylan. При ошибке 402 автоматически задействует локальный Gemini."""
+    """Отправляет запрос на внешний сервер Oylan. При ошибке 402/500 автоматически задействует локальный Gemini."""
     url = f'{BASE_URL}/assistant/{ASSISTANT_ID}/interactions/'
     
-    # Формируем контекст для внешнего API Oylan
     context = ""
     if history:
         for msg in history:
@@ -119,16 +119,17 @@ async def send_message(content: str, history: Optional[List[Dict[str, str]]] = N
             context += f"{prefix}: {msg['content']}\n"
             
     full_content = context + f'User: {content}' if context else content
-    data = {'content': full_content, 'stream': False}
+    
+    # Отправляем параметры в формате строгого JSON-объекта
+    payload = {'content': full_content, 'stream': False}
     
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            r = await client.post(url, headers=HEADERS, data=data)
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            r = await client.post(url, headers=HEADERS, json=payload)
             
             if r.status_code == 402:
-                print("⚠️ [Oylan API] Лимиты исчерпаны (HTTP 402). Подключаю локальный Gemini...")
-                # ВАЖНО: передаем чистый content (сообщение пользователя), а не склеенный full_content!
-                return generate_local_response(content, history)
+                print("⚠️ [Oylan API] Лимиты исчерпаны. Переключаю на резервный Gemini...")
+                return await generate_local_response(content, history)
                 
             r.raise_for_status()
             res_json = r.json()
@@ -142,9 +143,8 @@ async def send_message(content: str, history: Optional[List[Dict[str, str]]] = N
             return str(res_json)
             
     except Exception as e:
-        print(f"⚠️ Сбой внешнего сервера Oylan API ({e}). Переключаю обработку на резервный Gemini AI...")
-        # Передаем чистый content
-        return generate_local_response(content, history)
+        print(f"⚠️ Сбой внешнего Oylan API ({e}). Локальный каскад Gemini запущен...")
+        return await generate_local_response(content, history)
 
 
 async def fetch_assistants():
@@ -159,7 +159,7 @@ async def create_new_assistant(name: str, model: str = "Oylan"):
     url = f'{BASE_URL}/assistant/'
     payload = {'name': name, 'model': model}
     async with httpx.AsyncClient() as client:
-        r = await client.post(url, headers=HEADERS, data=payload, timeout=15.0)
+        r = await client.post(url, headers=HEADERS, json=payload, timeout=15.0)
         r.raise_for_status()
         return r.json()
 
@@ -167,6 +167,7 @@ async def create_new_assistant(name: str, model: str = "Oylan"):
 async def clear_assistant_context(assistant_id: str):
     url = f'{BASE_URL}/assistant/{assistant_id}/contexts/'
     async with httpx.AsyncClient() as client:
+        # Используем json= вместо data= для безопасной отработки роутинга на внешнем сервере
         r = await client.delete(url, headers=HEADERS, timeout=15.0)
         r.raise_for_status()
         return {"status": "context cleared", "code": r.status_code}

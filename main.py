@@ -2,7 +2,7 @@ import os
 from typing import List, Optional
 from fastapi import FastAPI, HTTPException, Depends
 from fastapi.responses import PlainTextResponse
-from fastapi.middleware.cors import CORSMiddleware  # Урок 6: Импортируем CORS
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import text
@@ -18,12 +18,13 @@ from services.oylan import (
     send_message, 
     fetch_assistants, 
     create_new_assistant, 
-    clear_assistant_context
+    clear_assistant_context,
+    ASSISTANT_ID
 )
 
 app = FastAPI(title="SentrySite AI - Oylan Comprehensive Enterprise Edition")
 
-# --- Урок 6: Настройка CORS для интеграции с React-фронтендом ---
+# --- Настройка CORS для интеграции с React-фронтендом ---
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -41,7 +42,6 @@ app.add_middleware(
 async def startup():
     async with engine.begin() as conn:
         print("⏳ Создание изолированной схемы user_schema...")
-        # Создаем схему, где у твоего пользователя гарантированно есть все права
         await conn.execute(text("CREATE SCHEMA IF NOT EXISTS user_schema;"))
         
         print("⏳ Проверка и создание таблицы messages внутри user_schema...")
@@ -145,40 +145,53 @@ async def clear_context(assistant_id: str):
         raise HTTPException(status_code=500, detail=f"Ошибка очистки контекста: {str(e)}")
 
 
-# --- ОСНОВНОЙ ЭНДПОИНТ ЧАТА С ПОДДЕРЖКОЙ ИСТОРИИ ИЗ БД ---
+# --- ОСНОВНОЙ ЭНДПОИНТ ЧАТА С ИНТЕЛЛЕКТУАЛЬНЫМ ФИЛЬТРОМ КОНТЕКСТА ---
 
 @app.post("/chat")
 async def chat_with_oylan(request: SiteRequest, db: AsyncSession = Depends(get_db)):
     if not request.message.strip():
         raise HTTPException(status_code=400, detail="Сообщение не может быть пустым")
         
-    pm25, city = get_pm25(request.lat, request.lon)
-    safe = pm25 <= 5
+    user_msg = request.message.strip()
     
-    full_prompt = (
-        f"Пользователь пишет: {request.message}. "
-        f"Контекст эко-мониторинга для объекта '{request.object_type}': "
-        f"Локация: {city} (координаты: {request.lat}, {request.lon}). "
-        f"Уровень PM2.5: {pm25} мкг/м³. Это {'соответствует' if safe else 'ПРЕВЫШАЕТ'} норму. "
-        f"{CURRENT_PROMPT_TEMPLATE}"
-    )
+    # Интеллектуальный анализ: является ли запрос техническим или экологическим?
+    is_eco_query = any(word in user_msg.lower() for word in [
+        "датчик", "вентиляц", "фильтр", "pm2.5", "инфильтрац", 
+        "эколог", "воздух", "загрязн", "показател", "норма"
+    ])
+    
+    if is_eco_query:
+        # Включаем полный строительно-экологический контекст, если вопрос целевой
+        pm25, city = get_pm25(request.lat, request.lon)
+        safe = pm25 <= 5
+        full_prompt = (
+            f"Пользователь пишет: {user_msg}. "
+            f"Контекст эко-мониторинга для объекта '{request.object_type}': "
+            f"Локация: {city} (координаты: {request.lat}, {request.lon}). "
+            f"Уровень PM2.5: {pm25} мкг/м³. Это {'соответствует' if safe else 'ПРЕВЫШАЕТ'} норму. "
+            f"{CURRENT_PROMPT_TEMPLATE}"
+        )
+    else:
+        # Для повседневного общения (приветствия, "кто создатель", шутки) передаем чистый текст
+        full_prompt = user_msg
     
     try:
-        # 1. Тянем историю переписки из Postgres
+        # 1. Загружаем историю диалога из PostgreSQL
         history = await get_history(db, request.session_id)
         
-        # 2. Отправляем в Oylan
+        # 2. Генерируем ответ напрямую через Oylan API 
         oylan_reply = await send_message(full_prompt, history)
         
-        # 3. Фиксируем диалог в базе данных
-        await save_message(db, request.session_id, 'user', request.message)
+        # 3. Сохраняем реплики в базу данных (сохраняем оригинальный запрос пользователя!)
+        await save_message(db, request.session_id, 'user', user_msg)
         await save_message(db, request.session_id, 'assistant', oylan_reply)
         
     except Exception as e:
         print(f"Ошибка вызова Oylan API или БД: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-    # 4. Сохраняем в локальное хранилище отчетов
+    # 4. Фиксируем структуру в кэше отчетов для сохранения работоспособности экспорта
+    pm25, city = get_pm25(request.lat, request.lon)
     report_id = str(len(REPORTS_STORAGE) + 1)
     REPORTS_STORAGE[report_id] = {
         "city": city,
@@ -187,18 +200,46 @@ async def chat_with_oylan(request: SiteRequest, db: AsyncSession = Depends(get_d
         "reply": oylan_reply
     }
 
-    # 5. Возвращаем JSON-ответ (совместимый с Chat.jsx)
+    # 5. Возвращаем JSON-ответ, совместимый с вашим Chat.jsx
     return {
         "report_id": report_id,
         "status": "ok",
         "city": city,
         "pm25": pm25,
-        "safe": safe,
+        "safe": pm25 <= 5,
         "object_type": request.object_type,
         "reply": oylan_reply,
-        "response": oylan_reply,  # Фикс: дублируем для фронтенда, если он ищет data.response
+        "response": oylan_reply,  # Дублируем для фронтенда
         "session_id": request.session_id
     }
+
+
+# --- 🔥 ЭНДПОИНТ ДЛЯ ПОЛНОЙ ОЧИСТКИ БАЗЫ ДАННЫХ И КОНТЕКСТА OYLAN ---
+
+@app.delete("/api/chat/clear")
+async def clear_chat_history(db: AsyncSession = Depends(get_db)):
+    """Полное асинхронное удаление записей из таблицы user_schema.messages и сброс Oylan контекста"""
+    try:
+        # Очищаем таблицу сообщений в PostgreSQL
+        await db.execute(text("DELETE FROM user_schema.messages;"))
+        await db.commit()
+    except Exception as e:
+        await db.rollback()
+        print(f"❌ Ошибка очистки базы данных PostgreSQL: {e}")
+        raise HTTPException(
+            status_code=500, 
+            detail="Не удалось очистить историю сообщений в PostgreSQL"
+        )
+
+    # Сбрасываем контекст оперативной памяти на удаленном сервере Oylan API
+    try:
+        if ASSISTANT_ID:
+            await clear_assistant_context(ASSISTANT_ID)
+    except Exception as e:
+        print(f"⚠️ Предупреждение: Не удалось очистить контекст внешнего Oylan API ({e})")
+
+    return {"status": "success", "message": "История локального чата в PostgreSQL и контекст Oylan сброшены!"}
+
 
 # --- ЭНДПОИНТ ДЛЯ ПРОСМОТРА ИСТОРИИ ИЗ ПОСТГРЕСА ---
 
@@ -271,7 +312,7 @@ def compare_sites(req: CompareRequest):
         "object_type": req.object_type,
         "result": {"winner": winner, "recommendation": "Выбрана оптимальная площадка"},
         "details": {"location_A": {"city": city_A, "pm25": pm25_A}, "location_B": {"city": city_B, "pm25": pm25_B}}
-    }
+    } 
 
 
 if __name__ == "__main__":
